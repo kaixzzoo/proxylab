@@ -1,0 +1,121 @@
+name: farm
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      trigger:
+        description: "sumber trigger"
+        default: "cron"
+        type: string
+
+concurrency:
+  group: farm
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: checkout core (privat)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/proxylab-core
+          ssh-key: ${{ secrets.CORE_DEPLOY_KEY }}
+          path: core
+          fetch-depth: 1
+
+      - name: gerbang farm
+        id: gate
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          INTERNAL_SECRET: ${{ secrets.INTERNAL_SECRET }}
+        run: |
+          set -e
+          R=$(curl -sS -m 20 -H "x-internal: $INTERNAL_SECRET" "$WORKER_URL/internal/state")
+          echo "$R" | python3 -c "
+import json,sys
+c=json.load(sys.stdin)['cfg']
+open('$GITHUB_WORKSPACE/core/build.env','w').write(
+ f\"CONCURRENCY={c['concurrency']}\nPOOL_CAP={c['pool_cap']}\nINT={c['interval_min']}\nPROTO={c['proto']}\n\")
+"
+          ON=$(echo "$R" | python3 -c "import json,sys;print('1' if json.load(sys.stdin)['on'] else '0')")
+          echo "on=$ON" >> $GITHUB_OUTPUT
+          echo "start=$(date +%s)" >> $GITHUB_OUTPUT
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.on == '1'
+        with:
+          python-version: "3.12"
+
+      - name: deps
+        if: steps.gate.outputs.on == '1'
+        run: pip install --quiet aiohttp aiohttp-socks
+
+      - name: harvest
+        if: steps.gate.outputs.on == '1'
+        working-directory: core
+        run: |
+          set -a; . ./build.env; set +a
+          python harvest.py
+
+      - name: validate
+        if: steps.gate.outputs.on == '1'
+        working-directory: core
+        run: |
+          set -a; . ./build.env; set +a
+          python validate.py
+
+      - name: publish
+        if: steps.gate.outputs.on == '1'
+        working-directory: core
+        run: |
+          set -a; . ./build.env; set +a
+          python publish.py
+
+      - name: push ke branch data (orphan, 1 commit)
+        if: steps.gate.outputs.on == '1'
+        run: |
+          set -e
+          mkdir -p /tmp/d && cd /tmp/d
+          git init -q
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          cp -r "$GITHUB_WORKSPACE/core/data/." .
+          git checkout -q -b data
+          git config user.name farm-bot
+          git config user.email farm-bot@users.noreply.github.com
+          git add -A
+          git commit -qm "data $(date -u +%FT%TZ)"
+          git push -qf origin data
+
+      - name: lapor
+        if: always() && steps.gate.outputs.on == '1'
+        working-directory: core
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          INTERNAL_SECRET: ${{ secrets.INTERNAL_SECRET }}
+          START_TS: ${{ steps.gate.outputs.start }}
+        run: python report.py
+
+      - name: jadwalkan putaran berikutnya
+        if: always() && steps.gate.outputs.on == '1'
+        env:
+          GH: ${{ secrets.GITHUB_TOKEN }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          INTERNAL_SECRET: ${{ secrets.INTERNAL_SECRET }}
+        run: |
+          INT=$(grep '^INT=' "$GITHUB_WORKSPACE/core/build.env" | cut -d= -f2)
+          sleep $(( ${INT:-10} * 60 ))
+          ON=$(curl -sS -m 20 -H "x-internal: $INTERNAL_SECRET" "$WORKER_URL/internal/state" \
+               | python3 -c "import json,sys;print('1' if json.load(sys.stdin)['on'] else '0')")
+          if [ "$ON" = "1" ]; then
+            curl -sS -m 20 -X POST \
+              -H "authorization: Bearer $GH" -H "accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/farm.yml/dispatches" \
+              -d '{"ref":"main","inputs":{"trigger":"loop"}}'
+          fi
